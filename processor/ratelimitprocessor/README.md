@@ -39,6 +39,7 @@ You can override one or more of the following fields:
 | Field                  | Description                                                                                                                                                                                                       | Required | Default    |
 |------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|------------|
 | `enabled`              | Enables the dynamic rate limiting feature.                                                                                                                                                                        | No       | `false`    |
+| `olric_peers`          | List of Olric peer addresses (`host:port`) used to form a small embedded cluster for persisting dynamic window state across instances. Leave empty for single-node. Default Olric port is `3322`.       | No       |            |
 | `window_duration`      | The time window duration for calculating traffic rates.                                                                                                                                                           | No       | `2m`       |
 | `default_window_multiplier` | The default factor by which the previous window rate is multiplied to get the dynamic limit. Can be overridden by providing a `window_configurator` extension.                                               | No       | `1.3`      |
 | `window_configurator`  | An optional extension to calculate window multiplier dynamically based on unique keys.                                                                                                                            | No       |            |
@@ -125,6 +126,14 @@ Assume the following configuration:
 
 This mechanism allows the rate limiter to adapt to sustained increases in traffic while the `window_multiplier` provides protection against sudden spikes that could destabilize the system.
 
+### Persistence of dynamic windows (Olric-backed store)
+
+When dynamic rate limiting is enabled, the processor embeds a lightweight [Olric](https://github.com/olric-io/olric) key-value store and wires it into Gubernator as a Loader/Store. This persists the dynamic window state so limits can survive restarts and be shared across multiple collector instances.
+
+- Only dynamic window entries are persisted; short-lived per-interval checks (e.g., 1s leaky bucket) are not stored.
+- Configure clustering via `dynamic_limits.olric_peers` to enable sharing state across nodes. If unset, a single-node embedded store is used.
+- The embedded Olric is configured with replication for resilience and forwards logs through the collector's logger.
+
 ### Examples
 
 Example when using as a local rate limiter:
@@ -202,6 +211,11 @@ processors:
       enabled: true
       window_multiplier: 1.5
       window_duration: 1m
+      # Optional: share dynamic window state across nodes
+      olric_peers:
+        - collector-a:3322
+        - collector-b:3322
+        - collector-c:3322
 ```
 
 ### Class-Based Dynamic Rate Limiting

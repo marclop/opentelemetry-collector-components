@@ -80,9 +80,23 @@ func newTestGubernatorRateLimiterMetrics(t *testing.T, cfg *Config) (
 // daemon and returns a new gubernatorRateLimiter instance that relies
 // on this daemon for rate limiting.
 func newTestGubernatorRateLimiter(t *testing.T, cfg *Config, c chan<- gubernator.HitEvent) *gubernatorRateLimiter {
-	rl := newGubernatorRateLimiterFrom(t, cfg,
-		startGubernatorCluster(t, c),
-	)
+	var store *guberStore
+	if cfg.DynamicRateLimiting.Enabled {
+		var err error
+		store, err = newGuberStore(zaptest.NewLogger(t),
+			cfg.DynamicRateLimiting.WindowDuration,
+			cfg.Strategy.String(),
+			cfg.DynamicRateLimiting.OlricPeers,
+		)
+		require.NoError(t, err)
+		require.NoError(t, store.Start(t.Context()))
+	}
+
+	daemon := startGubernatorCluster(t, c, store)
+	rl := newGubernatorRateLimiterFrom(t, cfg, daemon)
+	if store != nil {
+		rl.store = store
+	}
 	t.Cleanup(func() {
 		// Wait a bit after the test to shut down the daemon.
 		time.Sleep(50 * time.Millisecond)
@@ -127,14 +141,48 @@ func newGubernatorRateLimiterFrom(t *testing.T, cfg *Config, daemon *gubernator.
 	}
 }
 
-func startGubernatorCluster(t *testing.T, c chan<- gubernator.HitEvent) *gubernator.Daemon {
+type storeOpt struct{ store gubernator.Store }
+
+func (s *storeOpt) Apply(cfg *gubernator.DaemonConfig) {
+	if s == nil {
+		return
+	}
+	cfg.Store = s.store
+}
+
+func withStore(s *guberStore) *storeOpt {
+	if s == nil {
+		return nil
+	}
+	return &storeOpt{store: s}
+}
+
+type loaderOpt struct{ loader gubernator.Loader }
+
+func (l *loaderOpt) Apply(cfg *gubernator.DaemonConfig) {
+	if l == nil {
+		return
+	}
+	cfg.Loader = l.loader
+}
+
+func withLoader(l *guberStore) *loaderOpt {
+	if l == nil {
+		return nil
+	}
+	return &loaderOpt{loader: l}
+}
+
+func startGubernatorCluster(t *testing.T, c chan<- gubernator.HitEvent, store *guberStore) *gubernator.Daemon {
 	var err error
 	const local = "127.0.0.1:0"
 	peers := []gubernator.PeerInfo{{GRPCAddress: local, HTTPAddress: local}}
 	if c != nil {
-		err = cluster.StartWith(peers, cluster.WithEventChannel(c))
+		err = cluster.StartWith(peers, cluster.WithEventChannel(c),
+			withStore(store), withLoader(store),
+		)
 	} else {
-		err = cluster.StartWith(peers)
+		err = cluster.StartWith(peers, withStore(store), withLoader(store))
 	}
 	require.NoError(t, err)
 

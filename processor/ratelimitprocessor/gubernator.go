@@ -87,6 +87,7 @@ type gubernatorRateLimiter struct {
 	// Class resolver for class-based rate limiting
 	classResolver      ClassResolver
 	windowConfigurator WindowConfigurator
+	store              *guberStore
 	telemetryBuilder   *metadata.TelemetryBuilder
 	tracerProvider     trace.TracerProvider
 }
@@ -121,7 +122,7 @@ func newGubernatorRateLimiter(cfg *Config, logger *zap.Logger, telemetryBuilder 
 		return nil, fmt.Errorf("failed to create gubernator daemon config: %w", err)
 	}
 
-	return &gubernatorRateLimiter{
+	rl := gubernatorRateLimiter{
 		cfg:                cfg,
 		logger:             logger,
 		behavior:           gubernator.Behavior_BATCHING,
@@ -130,7 +131,23 @@ func newGubernatorRateLimiter(cfg *Config, logger *zap.Logger, telemetryBuilder 
 		tracerProvider:     tracerProvider,
 		classResolver:      noopResolver{},
 		windowConfigurator: defaultWindowConfigurator{multiplier: cfg.DynamicRateLimiting.DefaultWindowMultiplier},
-	}, nil
+	}
+
+	// When dynamic rate limiting is enabled, create a new store and add it to the daemon config.
+	// Allowing the longer windowed rate limits to be stored in the database for consistency.
+	if cfg.DynamicRateLimiting.Enabled {
+		store, err := newGuberStore(logger,
+			cfg.DynamicRateLimiting.WindowDuration,
+			cfg.Strategy.String(),
+			cfg.DynamicRateLimiting.OlricPeers,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gubernator store: %w", err)
+		}
+		rl.store = store
+		rl.daemonCfg.Loader, rl.daemonCfg.Store = store, store
+	}
+	return &rl, nil
 }
 
 func (r *gubernatorRateLimiter) Start(ctx context.Context, host component.Host) (err error) {
@@ -156,6 +173,13 @@ func (r *gubernatorRateLimiter) Start(ctx context.Context, host component.Host) 
 		r.windowConfigurator = wc.(WindowConfigurator)
 	}
 
+	// Start the store if it exists and dynamic rate limiting is enabled.
+	if r.cfg.DynamicRateLimiting.Enabled && r.store != nil {
+		if err := r.store.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start gubernator store: %w", err)
+		}
+	}
+	// Start Gubernator
 	r.daemon, err = gubernator.SpawnDaemon(ctx, r.daemonCfg)
 	if err != nil {
 		return fmt.Errorf("failed to spawn gubernator daemon: %w", err)
@@ -192,6 +216,11 @@ func (r *gubernatorRateLimiter) Shutdown(ctx context.Context) error {
 			return fmt.Errorf("failed to shutdown window configurator: %w", err)
 		}
 	}
+	if r.store != nil {
+		if err := r.store.Shutdown(ctx); err != nil {
+			return fmt.Errorf("failed to shutdown gubernator store: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -219,12 +248,13 @@ func (r *gubernatorRateLimiter) RateLimit(ctx context.Context, hits int) error {
 	// If dynamic rate limiting is enabled and not disabled for this request,
 	// calculate the dynamic rate and burst.
 	if r.cfg.DynamicRateLimiting.Enabled && !cfg.disableDynamic {
-		attrs := make([]attribute.KeyValue, 0, 3)
+		rate, burst = r.calculateRateAndBurst(ctx, cfg, uniqueKey, hits, now)
+		attrs := make([]attribute.KeyValue, 0, 4)
 		attrs = append(attrs,
 			attribute.String("source_kind", string(sourceKind)),
 			attribute.String("class", className),
+			// attribute.Int("rate", rate),
 		)
-		rate, burst = r.calculateRateAndBurst(ctx, cfg, uniqueKey, hits, now)
 		if rate < 0 { // Degraded mode - Gubernator unreachable. Fallback to static rate.
 			r.telemetryBuilder.RatelimitDynamicEscalations.Add(ctx, 1,
 				metric.WithAttributeSet(attribute.NewSet(append(attrs,
@@ -475,7 +505,8 @@ func (r *gubernatorRateLimiter) newDynamicRequest(
 		Limit:     maxLimit,
 		// Since Gubernator expires the unique key after the duration, double
 		// it to ensure the key survives until the end of the next window.
-		Duration:  drc.WindowDuration.Milliseconds()*2 + 1,
+		// 2x window duration + 1s
+		Duration:  drc.WindowDuration.Milliseconds()*2 + 1*time.Second.Milliseconds(),
 		CreatedAt: &drc.createdAt,
 	}
 }

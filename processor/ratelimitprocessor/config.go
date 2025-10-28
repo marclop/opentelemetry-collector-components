@@ -20,6 +20,7 @@ package ratelimitprocessor // import "github.com/elastic/opentelemetry-collector
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
@@ -72,6 +73,10 @@ type DynamicRateLimiting struct {
 	// Enabled tells the processor to use dynamic rate limiting.
 	Enabled bool `mapstructure:"enabled"`
 
+	// OlricPeers is the list of peers for the Olric cluster.
+	// Formatted as "host:port". (Port should be 7946 by default).
+	OlricPeers []string `mapstructure:"olric_peers"`
+
 	// WindowDuration defines the time window for which the dynamic rate limit
 	// is calculated on. Defaults to 2 minutes.
 	WindowDuration time.Duration `mapstructure:"window_duration"`
@@ -112,6 +117,11 @@ func (d *DynamicRateLimiting) Validate() error {
 	}
 	if d.WindowDuration <= 0 {
 		errs = append(errs, errors.New("window_duration must be greater than zero"))
+	}
+	for _, peer := range d.OlricPeers {
+		if len(strings.Split(peer, ":")) != 2 {
+			errs = append(errs, fmt.Errorf("dynamic: invalid olric peer %q: must be in the format of host:port", peer))
+		}
 	}
 	return errors.Join(errs...)
 }
